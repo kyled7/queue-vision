@@ -79,3 +79,40 @@ export interface ConnectionInfo {
    */
   readonly db?: number;
 }
+
+/**
+ * Metrics for queue performance monitoring.
+ *
+ * Provides statistics about queue throughput, reliability, and processing performance.
+ *
+ * @example
+ * ```typescript
+ * const metrics: Metrics = {
+ *   throughput: 150.5, // 150.5 jobs per hour
+ *   failureRate: 0.02, // 2% failure rate
+ *   avgProcessingTime: 2500 // 2.5 seconds average
+ * };
+ * ```
+ */
+export interface Metrics {
+  /**
+   * Number of jobs processed per hour.
+   *
+   * Calculated from recent completed and failed jobs.
+   */
+  readonly throughput: number;
+
+  /**
+   * Proportion of jobs that failed (0.0 to 1.0).
+   *
+   * Calculated as: failed / (completed + failed)
+   */
+  readonly failureRate: number;
+
+  /**
+   * Average time to process a job in milliseconds.
+   *
+   * Calculated as: average(finishedOn - processedOn) for completed jobs
+   */
+  readonly avgProcessingTime: number;
+}
