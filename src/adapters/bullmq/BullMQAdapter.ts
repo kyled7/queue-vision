@@ -25,7 +25,7 @@ import {
 } from '../QueueAdapter';
 import { Result } from '../../types/result';
 import { Queue, ConnectionInfo } from '../../types/queue';
-import { Job } from '../../types/job';
+import { Job, JobStatus } from '../../types/job';
 import { Ok, Err } from '../../utils/result';
 
 /**
@@ -413,7 +413,59 @@ export class BullMQAdapter implements QueueAdapter {
    * @returns Result<Job, Error> - Ok with job details, Err if job not found or retrieval failed
    */
   async getJob(queueName: string, jobId: string): Promise<Result<Job, Error>> {
-    return Err(new Error('Not implemented'));
+    try {
+      // Verify Redis connection is established
+      if (!this.client) {
+        return Err(new Error('Not connected to Redis. Call connect() first.'));
+      }
+
+      // Determine job status by checking which Redis data structure contains the job ID
+      // Check in order: waiting, active, completed, failed, delayed
+
+      // Check waiting list (LPOS returns position or null)
+      const waitingPos = await this.client.lpos(`bull:${queueName}:wait`, jobId);
+      if (waitingPos !== null) {
+        return await this.fetchJobData(queueName, jobId, JobStatus.Waiting);
+      }
+
+      // Check active list
+      const activePos = await this.client.lpos(`bull:${queueName}:active`, jobId);
+      if (activePos !== null) {
+        return await this.fetchJobData(queueName, jobId, JobStatus.Active);
+      }
+
+      // Check completed sorted set (ZSCORE returns score or null)
+      const completedScore = await this.client.zscore(
+        `bull:${queueName}:completed`,
+        jobId
+      );
+      if (completedScore !== null) {
+        return await this.fetchJobData(queueName, jobId, JobStatus.Completed);
+      }
+
+      // Check failed sorted set
+      const failedScore = await this.client.zscore(
+        `bull:${queueName}:failed`,
+        jobId
+      );
+      if (failedScore !== null) {
+        return await this.fetchJobData(queueName, jobId, JobStatus.Failed);
+      }
+
+      // Check delayed sorted set
+      const delayedScore = await this.client.zscore(
+        `bull:${queueName}:delayed`,
+        jobId
+      );
+      if (delayedScore !== null) {
+        return await this.fetchJobData(queueName, jobId, JobStatus.Delayed);
+      }
+
+      // Job not found in any data structure
+      return Err(new Error(`Job ${jobId} not found in queue ${queueName}`));
+    } catch (error) {
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   /**
