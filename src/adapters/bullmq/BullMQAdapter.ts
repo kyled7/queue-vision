@@ -24,7 +24,7 @@ import {
   Metrics,
 } from '../QueueAdapter';
 import { Result } from '../../types/result';
-import { Queue } from '../../types/queue';
+import { Queue, ConnectionInfo } from '../../types/queue';
 import { Job } from '../../types/job';
 import { Ok, Err } from '../../utils/result';
 
@@ -174,7 +174,73 @@ export class BullMQAdapter implements QueueAdapter {
    * @returns Result<Queue[], Error> - Ok with array of queues, Err if discovery failed
    */
   async listQueues(): Promise<Result<Queue[], Error>> {
-    return Err(new Error('Not implemented'));
+    try {
+      // Verify Redis connection is established
+      if (!this.client) {
+        return Err(new Error('Not connected to Redis. Call connect() first.'));
+      }
+
+      // Use SCAN to find all bull:*:meta keys (auto-discovery)
+      const metaKeys: string[] = [];
+      let cursor = '0';
+
+      do {
+        const [nextCursor, keys] = await this.client.scan(
+          cursor,
+          'MATCH',
+          'bull:*:meta',
+          'COUNT',
+          '100'
+        );
+        cursor = nextCursor;
+        metaKeys.push(...keys);
+      } while (cursor !== '0');
+
+      // Extract queue names and fetch job counts for each
+      const queues: Queue[] = [];
+
+      for (const metaKey of metaKeys) {
+        // Extract queue name from bull:{queueName}:meta pattern
+        const match = metaKey.match(/^bull:(.+):meta$/);
+        if (!match) continue;
+
+        const queueName = match[1];
+
+        // Fetch job counts in parallel for performance
+        // Lists: LLEN for wait/active, Sorted Sets: ZCARD for completed/failed/delayed
+        const [waiting, active, completed, failed, delayed] = await Promise.all(
+          [
+            this.client.llen(`bull:${queueName}:wait`),
+            this.client.llen(`bull:${queueName}:active`),
+            this.client.zcard(`bull:${queueName}:completed`),
+            this.client.zcard(`bull:${queueName}:failed`),
+            this.client.zcard(`bull:${queueName}:delayed`),
+          ]
+        );
+
+        // Extract connection info from client options
+        const options = this.client.options;
+        const connection: ConnectionInfo = {
+          host: options.host || 'localhost',
+          port: options.port || 6379,
+          ...(options.db && options.db !== 0 ? { db: options.db } : {}),
+        };
+
+        queues.push({
+          name: queueName,
+          waiting,
+          active,
+          completed,
+          failed,
+          delayed,
+          connection,
+        });
+      }
+
+      return Ok(queues);
+    } catch (error) {
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   /**
