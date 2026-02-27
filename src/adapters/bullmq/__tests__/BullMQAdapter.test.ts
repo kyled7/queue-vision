@@ -147,8 +147,228 @@ describe('BullMQAdapter', () => {
     });
   });
 
+  describe('connect', () => {
+    it('should successfully connect to Redis with valid connection string', async () => {
+      // Configure mock to simulate successful connection
+      mockSuccessfulConnection(mockRedis);
+
+      const result = await adapter.connect('redis://localhost:6379');
+
+      expect(result.ok).toBe(true);
+      expect(Redis).toHaveBeenCalledWith(
+        'redis://localhost:6379',
+        expect.objectContaining({
+          maxRetriesPerRequest: null,
+        })
+      );
+      expect(mockRedis.once).toHaveBeenCalledWith('ready', expect.any(Function));
+      expect(mockRedis.once).toHaveBeenCalledWith('error', expect.any(Function));
+    });
+
+    it('should successfully connect with custom port', async () => {
+      mockSuccessfulConnection(mockRedis);
+
+      const result = await adapter.connect('redis://localhost:6380');
+
+      expect(result.ok).toBe(true);
+      expect(Redis).toHaveBeenCalledWith(
+        'redis://localhost:6380',
+        expect.any(Object)
+      );
+    });
+
+    it('should successfully connect with database number', async () => {
+      mockSuccessfulConnection(mockRedis);
+
+      const result = await adapter.connect('redis://localhost:6379/2');
+
+      expect(result.ok).toBe(true);
+      expect(Redis).toHaveBeenCalledWith(
+        'redis://localhost:6379/2',
+        expect.any(Object)
+      );
+    });
+
+    it('should reject invalid connection string format', async () => {
+      const result = await adapter.connect('localhost:6379');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain(
+          'Invalid connection string format'
+        );
+      }
+      // Should not attempt to create Redis client for invalid format
+      expect(Redis).not.toHaveBeenCalled();
+    });
+
+    it('should reject connection string without redis:// prefix', async () => {
+      const result = await adapter.connect('http://localhost:6379');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain(
+          'Invalid connection string format'
+        );
+      }
+      expect(Redis).not.toHaveBeenCalled();
+    });
+
+    it('should handle Redis connection failure', async () => {
+      const connectionError = new Error('ECONNREFUSED: Connection refused');
+      mockFailedConnection(mockRedis, connectionError);
+
+      const result = await adapter.connect('redis://localhost:6379');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe(connectionError);
+      }
+      // Should cleanup client on connection failure
+      expect(mockRedis.disconnect).toHaveBeenCalled();
+    });
+
+    it('should handle Redis authentication failure', async () => {
+      const authError = new Error('NOAUTH: Authentication required');
+      mockFailedConnection(mockRedis, authError);
+
+      const result = await adapter.connect('redis://localhost:6379');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Authentication required');
+      }
+      expect(mockRedis.disconnect).toHaveBeenCalled();
+    });
+
+    it('should pass maxRetriesPerRequest: null option to Redis client', async () => {
+      mockSuccessfulConnection(mockRedis);
+
+      await adapter.connect('redis://localhost:6379');
+
+      expect(Redis).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          maxRetriesPerRequest: null,
+        })
+      );
+    });
+  });
+
+  describe('disconnect', () => {
+    it('should successfully disconnect when connected', async () => {
+      // First connect
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Then disconnect
+      const result = await adapter.disconnect();
+
+      expect(result.ok).toBe(true);
+      expect(mockRedis.quit).toHaveBeenCalled();
+    });
+
+    it('should return Ok when disconnecting without connection', async () => {
+      // Disconnect without connecting first
+      const result = await adapter.disconnect();
+
+      expect(result.ok).toBe(true);
+      // Should not attempt to quit non-existent client
+      expect(mockRedis.quit).not.toHaveBeenCalled();
+    });
+
+    it('should handle multiple disconnect calls safely', async () => {
+      // Connect first
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Disconnect twice
+      const result1 = await adapter.disconnect();
+      const result2 = await adapter.disconnect();
+
+      expect(result1.ok).toBe(true);
+      expect(result2.ok).toBe(true);
+      // quit() should only be called once (first disconnect)
+      expect(mockRedis.quit).toHaveBeenCalledTimes(1);
+    });
+
+    it('should handle quit() failure by forcing disconnect', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Simulate quit() throwing an error
+      const quitError = new Error('Connection already closed');
+      mockRedis.quit.mockRejectedValue(quitError);
+
+      const result = await adapter.disconnect();
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Connection already closed');
+      }
+      // Should fallback to disconnect() on error
+      expect(mockRedis.disconnect).toHaveBeenCalled();
+    });
+
+    it('should cleanup subscriber if present during disconnect', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Create a mock subscriber to simulate active subscription
+      const mockSubscriber = createMockRedis();
+      (adapter as any).subscriber = mockSubscriber;
+
+      const result = await adapter.disconnect();
+
+      expect(result.ok).toBe(true);
+      // Should unsubscribe and quit subscriber first
+      expect(mockSubscriber.punsubscribe).toHaveBeenCalled();
+      expect(mockSubscriber.quit).toHaveBeenCalled();
+      // Then quit main client
+      expect(mockRedis.quit).toHaveBeenCalled();
+    });
+
+    it('should handle subscriber cleanup failure gracefully', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Create a mock subscriber that fails on punsubscribe
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.punsubscribe.mockRejectedValue(
+        new Error('Unsubscribe failed')
+      );
+      (adapter as any).subscriber = mockSubscriber;
+
+      const result = await adapter.disconnect();
+
+      expect(result.ok).toBe(true);
+      // Should force disconnect subscriber on error
+      expect(mockSubscriber.disconnect).toHaveBeenCalled();
+      // Should still cleanup main client
+      expect(mockRedis.quit).toHaveBeenCalled();
+    });
+
+    it('should cleanup both client and subscriber on error', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Add subscriber
+      const mockSubscriber = createMockRedis();
+      (adapter as any).subscriber = mockSubscriber;
+
+      // Make main client quit fail
+      mockRedis.quit.mockRejectedValue(new Error('Quit failed'));
+
+      const result = await adapter.disconnect();
+
+      expect(result.ok).toBe(false);
+      // Should force disconnect both clients
+      expect(mockSubscriber.disconnect).toHaveBeenCalled();
+      expect(mockRedis.disconnect).toHaveBeenCalled();
+    });
+  });
+
   // Additional test suites will be added in subsequent subtasks:
-  // - subtask-12-2: connect/disconnect tests
   // - subtask-12-3: listQueues tests
   // - subtask-12-4: getJobs/getJob tests
   // - subtask-12-5: getMetrics tests
