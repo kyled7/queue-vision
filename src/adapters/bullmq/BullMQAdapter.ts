@@ -253,7 +253,153 @@ export class BullMQAdapter implements QueueAdapter {
    * @returns Result<Job[], Error> - Ok with array of jobs, Err if retrieval failed
    */
   async getJobs(options: GetJobsOptions): Promise<Result<Job[], Error>> {
-    return Err(new Error('Not implemented'));
+    try {
+      // Verify Redis connection is established
+      if (!this.client) {
+        return Err(new Error('Not connected to Redis. Call connect() first.'));
+      }
+
+      const { queueName, status, offset = 0, limit = 100 } = options;
+
+      // Calculate Redis range indices (Redis uses 0-based indexing)
+      const start = offset;
+      const stop = offset + limit - 1;
+
+      // Fetch job IDs based on status using appropriate Redis data structure
+      let jobIds: string[];
+
+      switch (status) {
+        case 'waiting':
+          // Waiting jobs are stored in a Redis list (bull:{queue}:wait)
+          jobIds = await this.client.lrange(
+            `bull:${queueName}:wait`,
+            start,
+            stop
+          );
+          break;
+
+        case 'active':
+          // Active jobs are stored in a Redis list (bull:{queue}:active)
+          jobIds = await this.client.lrange(
+            `bull:${queueName}:active`,
+            start,
+            stop
+          );
+          break;
+
+        case 'completed':
+          // Completed jobs are stored in a sorted set (bull:{queue}:completed)
+          // Sorted by completion timestamp, newest first (use ZREVRANGE for reverse order)
+          jobIds = await this.client.zrevrange(
+            `bull:${queueName}:completed`,
+            start,
+            stop
+          );
+          break;
+
+        case 'failed':
+          // Failed jobs are stored in a sorted set (bull:{queue}:failed)
+          // Sorted by failure timestamp, newest first
+          jobIds = await this.client.zrevrange(
+            `bull:${queueName}:failed`,
+            start,
+            stop
+          );
+          break;
+
+        case 'delayed':
+          // Delayed jobs are stored in a sorted set (bull:{queue}:delayed)
+          // Sorted by delay timestamp (when they should be promoted to waiting)
+          jobIds = await this.client.zrange(
+            `bull:${queueName}:delayed`,
+            start,
+            stop
+          );
+          break;
+
+        default:
+          return Err(new Error(`Unknown job status: ${status}`));
+      }
+
+      // Fetch full job data for each ID in parallel
+      const jobResults = await Promise.all(
+        jobIds.map((jobId) => this.fetchJobData(queueName, jobId, status))
+      );
+
+      // Filter out any failed fetches and extract successful jobs
+      const jobs: Job[] = [];
+      for (const result of jobResults) {
+        if (result.ok) {
+          jobs.push(result.value);
+        }
+        // Skip jobs that failed to fetch (they may have been deleted)
+      }
+
+      return Ok(jobs);
+    } catch (error) {
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  /**
+   * Fetch and parse job data from Redis hash.
+   *
+   * Helper method that reads the job hash from Redis and parses all fields
+   * into a Job object. Used by both getJobs() and getJob().
+   *
+   * @param queueName - The name of the queue containing the job
+   * @param jobId - The unique identifier of the job
+   * @param status - The current status of the job
+   * @returns Result<Job, Error> - Ok with job data, Err if job not found or parsing failed
+   */
+  private async fetchJobData(
+    queueName: string,
+    jobId: string,
+    status: JobStatus
+  ): Promise<Result<Job, Error>> {
+    try {
+      if (!this.client) {
+        return Err(new Error('Not connected to Redis'));
+      }
+
+      // Fetch all fields from job hash (bull:{queue}:{jobId})
+      const jobData = await this.client.hgetall(`bull:${queueName}:${jobId}`);
+
+      // Job not found or deleted
+      if (!jobData || Object.keys(jobData).length === 0) {
+        return Err(new Error(`Job ${jobId} not found in queue ${queueName}`));
+      }
+
+      // Parse job fields from Redis hash
+      // BullMQ stores data as JSON strings in the hash
+      const job: Job = {
+        id: jobId,
+        queueName,
+        data: jobData.data ? JSON.parse(jobData.data) : null,
+        status,
+        error: jobData.failedReason || null,
+        stacktrace: jobData.stacktrace ? JSON.parse(jobData.stacktrace) : null,
+        attempts: parseInt(jobData.attemptsMade || '0', 10),
+        maxAttempts: jobData.opts
+          ? JSON.parse(jobData.opts).attempts
+          : undefined,
+        timestamp: parseInt(jobData.timestamp || '0', 10),
+        processedOn: jobData.processedOn
+          ? parseInt(jobData.processedOn, 10)
+          : null,
+        finishedOn: jobData.finishedOn
+          ? parseInt(jobData.finishedOn, 10)
+          : null,
+        returnvalue: jobData.returnvalue
+          ? JSON.parse(jobData.returnvalue)
+          : undefined,
+        delay: jobData.delay ? parseInt(jobData.delay, 10) : undefined,
+      };
+
+      return Ok(job);
+    } catch (error) {
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   /**
