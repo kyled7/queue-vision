@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+package-lock.json
 
 # Auto Claude generated files
 .auto-claude/
