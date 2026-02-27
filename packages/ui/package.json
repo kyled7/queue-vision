@@ -1,0 +1,15 @@
+{
+  "name": "@queue-vision/ui",
+  "version": "0.1.0",
+  "private": true,
+  "description": "React frontend for QueueVision",
+  "type": "module",
+  "scripts": {
+    "build": "echo 'stub — not yet implemented'",
+    "dev": "echo 'stub'",
+    "typecheck": "echo 'stub'"
+  },
+  "dependencies": {
+    "@queue-vision/core": "workspace:*"
+  }
+}

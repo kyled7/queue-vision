@@ -1,3 +1,6 @@
+node_modules/
+dist/
+*.tsbuildinfo
 
 # Auto Claude generated files
 .auto-claude/

@@ -1,0 +1,24 @@
+{
+  "name": "@queue-vision/adapter-bullmq",
+  "version": "0.1.0",
+  "description": "BullMQ adapter for QueueVision",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "echo 'stub — not yet implemented'",
+    "typecheck": "echo 'stub'"
+  },
+  "dependencies": {
+    "@queue-vision/core": "workspace:*"
+  }
+}
