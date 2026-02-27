@@ -6,6 +6,7 @@
  */
 
 import { BullMQAdapter } from '../BullMQAdapter';
+import { JobStatus } from '../../../types/job';
 import Redis from 'ioredis';
 
 // Mock ioredis module
@@ -742,8 +743,738 @@ describe('BullMQAdapter', () => {
     });
   });
 
+  describe('getJobs', () => {
+    it('should retrieve waiting jobs with pagination', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock lrange to return job IDs from waiting list
+      mockRedis.lrange.mockResolvedValue(['1', '2', '3']);
+
+      // Mock hgetall to return job data for each job
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        if (key === 'bull:email-queue:1') {
+          return Promise.resolve({
+            data: JSON.stringify({ to: 'user1@example.com' }),
+            timestamp: '1640000000000',
+            attemptsMade: '0',
+          });
+        } else if (key === 'bull:email-queue:2') {
+          return Promise.resolve({
+            data: JSON.stringify({ to: 'user2@example.com' }),
+            timestamp: '1640000001000',
+            attemptsMade: '0',
+          });
+        } else if (key === 'bull:email-queue:3') {
+          return Promise.resolve({
+            data: JSON.stringify({ to: 'user3@example.com' }),
+            timestamp: '1640000002000',
+            attemptsMade: '0',
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getJobs({
+        queueName: 'email-queue',
+        status: JobStatus.Waiting,
+        offset: 0,
+        limit: 10,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(3);
+        expect(result.value[0]).toMatchObject({
+          id: '1',
+          queueName: 'email-queue',
+          status: JobStatus.Waiting,
+          attempts: 0,
+        });
+        expect(result.value[0]!.data).toEqual({ to: 'user1@example.com' });
+      }
+
+      // Verify correct Redis commands
+      expect(mockRedis.lrange).toHaveBeenCalledWith(
+        'bull:email-queue:wait',
+        0,
+        9
+      );
+      expect(mockRedis.hgetall).toHaveBeenCalledWith('bull:email-queue:1');
+      expect(mockRedis.hgetall).toHaveBeenCalledWith('bull:email-queue:2');
+      expect(mockRedis.hgetall).toHaveBeenCalledWith('bull:email-queue:3');
+    });
+
+    it('should retrieve active jobs', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lrange.mockResolvedValue(['10', '11']);
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        if (key === 'bull:processing:10') {
+          return Promise.resolve({
+            data: JSON.stringify({ task: 'process-video' }),
+            timestamp: '1640000000000',
+            processedOn: '1640000010000',
+            attemptsMade: '1',
+          });
+        } else if (key === 'bull:processing:11') {
+          return Promise.resolve({
+            data: JSON.stringify({ task: 'process-image' }),
+            timestamp: '1640000001000',
+            processedOn: '1640000011000',
+            attemptsMade: '1',
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getJobs({
+        queueName: 'processing',
+        status: JobStatus.Active,
+        offset: 0,
+        limit: 100,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(2);
+        expect(result.value[0]).toMatchObject({
+          id: '10',
+          queueName: 'processing',
+          status: JobStatus.Active,
+          attempts: 1,
+        });
+        expect(result.value[0]!.processedOn).toBe(1640000010000);
+      }
+
+      expect(mockRedis.lrange).toHaveBeenCalledWith(
+        'bull:processing:active',
+        0,
+        99
+      );
+    });
+
+    it('should retrieve completed jobs sorted by newest first', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock zrevrange for completed jobs (sorted by completion time, newest first)
+      mockRedis.zrevrange.mockResolvedValue(['20', '21']);
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        if (key === 'bull:orders:20') {
+          return Promise.resolve({
+            data: JSON.stringify({ orderId: 1001 }),
+            timestamp: '1640000000000',
+            processedOn: '1640000005000',
+            finishedOn: '1640000010000',
+            returnvalue: JSON.stringify({ success: true }),
+            attemptsMade: '1',
+          });
+        } else if (key === 'bull:orders:21') {
+          return Promise.resolve({
+            data: JSON.stringify({ orderId: 1002 }),
+            timestamp: '1640000001000',
+            processedOn: '1640000006000',
+            finishedOn: '1640000009000',
+            returnvalue: JSON.stringify({ success: true }),
+            attemptsMade: '1',
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getJobs({
+        queueName: 'orders',
+        status: JobStatus.Completed,
+        offset: 0,
+        limit: 50,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(2);
+        expect(result.value[0]).toMatchObject({
+          id: '20',
+          queueName: 'orders',
+          status: JobStatus.Completed,
+          finishedOn: 1640000010000,
+        });
+        expect(result.value[0]!.returnvalue).toEqual({ success: true });
+      }
+
+      expect(mockRedis.zrevrange).toHaveBeenCalledWith(
+        'bull:orders:completed',
+        0,
+        49
+      );
+    });
+
+    it('should retrieve failed jobs with error information', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.zrevrange.mockResolvedValue(['30']);
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ email: 'invalid-email' }),
+        timestamp: '1640000000000',
+        processedOn: '1640000005000',
+        finishedOn: '1640000008000',
+        failedReason: 'Invalid email address',
+        stacktrace: JSON.stringify(['Error: Invalid email address', '  at validate()']),
+        attemptsMade: '3',
+        opts: JSON.stringify({ attempts: 3 }),
+      });
+
+      const result = await adapter.getJobs({
+        queueName: 'notifications',
+        status: JobStatus.Failed,
+        offset: 0,
+        limit: 10,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(1);
+        expect(result.value[0]).toMatchObject({
+          id: '30',
+          queueName: 'notifications',
+          status: JobStatus.Failed,
+          error: 'Invalid email address',
+          attempts: 3,
+          maxAttempts: 3,
+        });
+        expect(result.value[0]!.stacktrace).toEqual([
+          'Error: Invalid email address',
+          '  at validate()',
+        ]);
+      }
+
+      expect(mockRedis.zrevrange).toHaveBeenCalledWith(
+        'bull:notifications:failed',
+        0,
+        9
+      );
+    });
+
+    it('should retrieve delayed jobs', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.zrange.mockResolvedValue(['40']);
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ reminder: 'Follow up email' }),
+        timestamp: '1640000000000',
+        delay: '3600000',
+        attemptsMade: '0',
+      });
+
+      const result = await adapter.getJobs({
+        queueName: 'scheduled',
+        status: JobStatus.Delayed,
+        offset: 0,
+        limit: 100,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(1);
+        expect(result.value[0]).toMatchObject({
+          id: '40',
+          queueName: 'scheduled',
+          status: JobStatus.Delayed,
+          delay: 3600000,
+        });
+      }
+
+      expect(mockRedis.zrange).toHaveBeenCalledWith(
+        'bull:scheduled:delayed',
+        0,
+        99
+      );
+    });
+
+    it('should handle pagination with offset', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lrange.mockResolvedValue(['100', '101']);
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        const id = key.split(':').pop();
+        return Promise.resolve({
+          data: JSON.stringify({ id }),
+          timestamp: '1640000000000',
+          attemptsMade: '0',
+        });
+      });
+
+      const result = await adapter.getJobs({
+        queueName: 'test',
+        status: JobStatus.Waiting,
+        offset: 50,
+        limit: 2,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(2);
+      }
+
+      // Verify offset and limit are correctly calculated (start=50, stop=51)
+      expect(mockRedis.lrange).toHaveBeenCalledWith('bull:test:wait', 50, 51);
+    });
+
+    it('should return empty array when no jobs match', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lrange.mockResolvedValue([]);
+
+      const result = await adapter.getJobs({
+        queueName: 'empty-queue',
+        status: JobStatus.Waiting,
+        offset: 0,
+        limit: 100,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toEqual([]);
+      }
+    });
+
+    it('should filter out jobs that fail to fetch', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lrange.mockResolvedValue(['1', '2', '3']);
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        if (key === 'bull:test:1') {
+          return Promise.resolve({
+            data: JSON.stringify({ valid: true }),
+            timestamp: '1640000000000',
+            attemptsMade: '0',
+          });
+        } else if (key === 'bull:test:2') {
+          // Job deleted or missing
+          return Promise.resolve({});
+        } else if (key === 'bull:test:3') {
+          return Promise.resolve({
+            data: JSON.stringify({ valid: true }),
+            timestamp: '1640000002000',
+            attemptsMade: '0',
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getJobs({
+        queueName: 'test',
+        status: JobStatus.Waiting,
+        offset: 0,
+        limit: 10,
+      });
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Should only include jobs 1 and 3 (job 2 was missing)
+        expect(result.value).toHaveLength(2);
+        expect(result.value[0]!.id).toBe('1');
+        expect(result.value[1]!.id).toBe('3');
+      }
+    });
+
+    it('should return error when not connected', async () => {
+      const result = await adapter.getJobs({
+        queueName: 'test',
+        status: JobStatus.Waiting,
+        offset: 0,
+        limit: 100,
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Not connected to Redis');
+      }
+
+      expect(mockRedis.lrange).not.toHaveBeenCalled();
+    });
+
+    it('should return error for unknown job status', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const result = await adapter.getJobs({
+        queueName: 'test',
+        status: 'invalid-status' as any,
+        offset: 0,
+        limit: 100,
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Unknown job status');
+      }
+    });
+
+    it('should handle Redis lrange failure', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const redisError = new Error('Redis connection lost');
+      mockRedis.lrange.mockRejectedValue(redisError);
+
+      const result = await adapter.getJobs({
+        queueName: 'test',
+        status: JobStatus.Waiting,
+        offset: 0,
+        limit: 100,
+      });
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe(redisError);
+      }
+    });
+
+    it('should use default pagination values when not specified', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lrange.mockResolvedValue([]);
+
+      await adapter.getJobs({
+        queueName: 'test',
+        status: JobStatus.Waiting,
+      });
+
+      // Default offset=0, limit=100, so range should be 0 to 99
+      expect(mockRedis.lrange).toHaveBeenCalledWith('bull:test:wait', 0, 99);
+    });
+  });
+
+  describe('getJob', () => {
+    it('should retrieve a waiting job by ID', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock lpos to find job in waiting list
+      mockRedis.lpos.mockImplementation((key: string, jobId: string) => {
+        if (key === 'bull:email:wait' && jobId === '123') {
+          return Promise.resolve(0); // Found at position 0
+        }
+        return Promise.resolve(null);
+      });
+
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ to: 'user@example.com', subject: 'Welcome' }),
+        timestamp: '1640000000000',
+        attemptsMade: '0',
+        opts: JSON.stringify({ attempts: 3 }),
+      });
+
+      const result = await adapter.getJob('email', '123');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toMatchObject({
+          id: '123',
+          queueName: 'email',
+          status: JobStatus.Waiting,
+          attempts: 0,
+          maxAttempts: 3,
+        });
+        expect(result.value.data).toEqual({
+          to: 'user@example.com',
+          subject: 'Welcome',
+        });
+      }
+
+      // Verify it checked waiting list
+      expect(mockRedis.lpos).toHaveBeenCalledWith('bull:email:wait', '123');
+      expect(mockRedis.hgetall).toHaveBeenCalledWith('bull:email:123');
+    });
+
+    it('should retrieve an active job by ID', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Not in waiting, but in active
+      mockRedis.lpos.mockImplementation((key: string) => {
+        if (key === 'bull:processing:wait') return Promise.resolve(null);
+        if (key === 'bull:processing:active') return Promise.resolve(2);
+        return Promise.resolve(null);
+      });
+
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ videoId: 'abc123' }),
+        timestamp: '1640000000000',
+        processedOn: '1640000010000',
+        attemptsMade: '1',
+      });
+
+      const result = await adapter.getJob('processing', '456');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toMatchObject({
+          id: '456',
+          queueName: 'processing',
+          status: JobStatus.Active,
+          processedOn: 1640000010000,
+        });
+      }
+
+      expect(mockRedis.lpos).toHaveBeenCalledWith('bull:processing:active', '456');
+    });
+
+    it('should retrieve a completed job by ID', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Not in lists, but in completed sorted set
+      mockRedis.lpos.mockResolvedValue(null);
+      mockRedis.zscore.mockImplementation((key: string) => {
+        if (key === 'bull:orders:completed') return Promise.resolve('1640000020000');
+        return Promise.resolve(null);
+      });
+
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ orderId: 1001, items: 5 }),
+        timestamp: '1640000000000',
+        processedOn: '1640000005000',
+        finishedOn: '1640000020000',
+        returnvalue: JSON.stringify({ status: 'shipped' }),
+        attemptsMade: '1',
+      });
+
+      const result = await adapter.getJob('orders', '789');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toMatchObject({
+          id: '789',
+          queueName: 'orders',
+          status: JobStatus.Completed,
+          finishedOn: 1640000020000,
+        });
+        expect(result.value.returnvalue).toEqual({ status: 'shipped' });
+      }
+
+      expect(mockRedis.zscore).toHaveBeenCalledWith('bull:orders:completed', '789');
+    });
+
+    it('should retrieve a failed job by ID', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lpos.mockResolvedValue(null);
+      mockRedis.zscore.mockImplementation((key: string) => {
+        if (key === 'bull:email:completed') return Promise.resolve(null);
+        if (key === 'bull:email:failed') return Promise.resolve('1640000030000');
+        return Promise.resolve(null);
+      });
+
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ to: 'invalid@' }),
+        timestamp: '1640000000000',
+        processedOn: '1640000005000',
+        finishedOn: '1640000030000',
+        failedReason: 'Invalid email format',
+        stacktrace: JSON.stringify(['Error: Invalid email format', '  at sendEmail()']),
+        attemptsMade: '3',
+        opts: JSON.stringify({ attempts: 3 }),
+      });
+
+      const result = await adapter.getJob('email', '999');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toMatchObject({
+          id: '999',
+          queueName: 'email',
+          status: JobStatus.Failed,
+          error: 'Invalid email format',
+          attempts: 3,
+          maxAttempts: 3,
+        });
+        expect(result.value.stacktrace).toEqual([
+          'Error: Invalid email format',
+          '  at sendEmail()',
+        ]);
+      }
+    });
+
+    it('should retrieve a delayed job by ID', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lpos.mockResolvedValue(null);
+      mockRedis.zscore.mockImplementation((key: string) => {
+        if (key === 'bull:scheduled:delayed') return Promise.resolve('1640003600000');
+        return Promise.resolve(null);
+      });
+
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ taskId: 'reminder-1' }),
+        timestamp: '1640000000000',
+        delay: '3600000',
+        attemptsMade: '0',
+      });
+
+      const result = await adapter.getJob('scheduled', '111');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toMatchObject({
+          id: '111',
+          queueName: 'scheduled',
+          status: JobStatus.Delayed,
+          delay: 3600000,
+        });
+      }
+
+      expect(mockRedis.zscore).toHaveBeenCalledWith('bull:scheduled:delayed', '111');
+    });
+
+    it('should return error when job not found', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Not found in any data structure
+      mockRedis.lpos.mockResolvedValue(null);
+      mockRedis.zscore.mockResolvedValue(null);
+
+      const result = await adapter.getJob('test', 'non-existent');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Job non-existent not found');
+      }
+
+      // Verify all data structures were checked
+      expect(mockRedis.lpos).toHaveBeenCalledWith('bull:test:wait', 'non-existent');
+      expect(mockRedis.lpos).toHaveBeenCalledWith('bull:test:active', 'non-existent');
+      expect(mockRedis.zscore).toHaveBeenCalledWith('bull:test:completed', 'non-existent');
+      expect(mockRedis.zscore).toHaveBeenCalledWith('bull:test:failed', 'non-existent');
+      expect(mockRedis.zscore).toHaveBeenCalledWith('bull:test:delayed', 'non-existent');
+    });
+
+    it('should return error when job hash is empty', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Found in waiting list
+      mockRedis.lpos.mockImplementation((key: string) => {
+        if (key === 'bull:test:wait') return Promise.resolve(0);
+        return Promise.resolve(null);
+      });
+
+      // But job hash is empty (job was deleted)
+      mockRedis.hgetall.mockResolvedValue({});
+
+      const result = await adapter.getJob('test', '123');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Job 123 not found');
+      }
+    });
+
+    it('should return error when not connected', async () => {
+      const result = await adapter.getJob('test', '123');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Not connected to Redis');
+      }
+
+      expect(mockRedis.lpos).not.toHaveBeenCalled();
+      expect(mockRedis.hgetall).not.toHaveBeenCalled();
+    });
+
+    it('should handle Redis lpos failure', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const redisError = new Error('Redis command failed');
+      mockRedis.lpos.mockRejectedValue(redisError);
+
+      const result = await adapter.getJob('test', '123');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe(redisError);
+      }
+    });
+
+    it('should handle Redis hgetall failure', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lpos.mockImplementation((key: string) => {
+        if (key === 'bull:test:wait') return Promise.resolve(0);
+        return Promise.resolve(null);
+      });
+
+      const redisError = new Error('Hash read failed');
+      mockRedis.hgetall.mockRejectedValue(redisError);
+
+      const result = await adapter.getJob('test', '123');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe(redisError);
+      }
+    });
+
+    it('should parse job data with all optional fields', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.lpos.mockImplementation((key: string) => {
+        if (key === 'bull:test:wait') return Promise.resolve(0);
+        return Promise.resolve(null);
+      });
+
+      // Job with all optional fields present
+      mockRedis.hgetall.mockResolvedValue({
+        data: JSON.stringify({ key: 'value' }),
+        timestamp: '1640000000000',
+        processedOn: '1640000005000',
+        finishedOn: '1640000010000',
+        failedReason: 'Some error',
+        stacktrace: JSON.stringify(['line1', 'line2']),
+        returnvalue: JSON.stringify({ result: 42 }),
+        attemptsMade: '2',
+        delay: '5000',
+        opts: JSON.stringify({ attempts: 5, backoff: 1000 }),
+      });
+
+      const result = await adapter.getJob('test', '123');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toMatchObject({
+          id: '123',
+          queueName: 'test',
+          status: JobStatus.Waiting,
+          data: { key: 'value' },
+          error: 'Some error',
+          stacktrace: ['line1', 'line2'],
+          attempts: 2,
+          maxAttempts: 5,
+          timestamp: 1640000000000,
+          processedOn: 1640000005000,
+          finishedOn: 1640000010000,
+          returnvalue: { result: 42 },
+          delay: 5000,
+        });
+      }
+    });
+  });
+
   // Additional test suites will be added in subsequent subtasks:
-  // - subtask-12-4: getJobs/getJob tests
   // - subtask-12-5: getMetrics tests
   // - subtask-12-6: subscribe tests
 });
