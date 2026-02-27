@@ -90,7 +90,49 @@ export class BullMQAdapter implements QueueAdapter {
    * @returns Result<void, Error> - Ok if connection successful, Err if failed
    */
   async connect(connectionString: string): Promise<Result<void, Error>> {
-    return Err(new Error('Not implemented'));
+    try {
+      // Validate connection string format
+      if (!connectionString.startsWith('redis://')) {
+        return Err(
+          new Error(
+            'Invalid connection string format. Expected redis://host:port'
+          )
+        );
+      }
+
+      // Create Redis client (ioredis supports redis:// URLs directly)
+      this.client = new Redis(connectionString, {
+        maxRetriesPerRequest: null, // Required for blocking commands in BullMQ
+      });
+
+      // Wait for connection to be ready or fail
+      return await new Promise<Result<void, Error>>((resolve) => {
+        if (!this.client) {
+          resolve(Err(new Error('Client initialization failed')));
+          return;
+        }
+
+        this.client.once('ready', () => {
+          resolve(Ok(undefined));
+        });
+
+        this.client.once('error', (error: Error) => {
+          // Cleanup on connection failure
+          if (this.client) {
+            this.client.disconnect();
+            this.client = null;
+          }
+          resolve(Err(error));
+        });
+      });
+    } catch (error) {
+      // Handle any unexpected errors during setup
+      if (this.client) {
+        this.client.disconnect();
+        this.client = null;
+      }
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   /**
