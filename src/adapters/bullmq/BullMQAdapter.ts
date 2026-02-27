@@ -478,7 +478,94 @@ export class BullMQAdapter implements QueueAdapter {
    * @returns Result<Metrics, Error> - Ok with metrics data, Err if calculation failed
    */
   async getMetrics(queueName: string): Promise<Result<Metrics, Error>> {
-    return Err(new Error('Not implemented'));
+    try {
+      // Verify Redis connection is established
+      if (!this.client) {
+        return Err(new Error('Not connected to Redis. Call connect() first.'));
+      }
+
+      // Fetch last 100 completed and failed jobs with their timestamps (scores)
+      // Using ZREVRANGE with WITHSCORES to get job IDs and completion timestamps
+      const [completedWithScores, failedWithScores] = await Promise.all([
+        this.client.zrevrange(
+          `bull:${queueName}:completed`,
+          0,
+          99,
+          'WITHSCORES'
+        ),
+        this.client.zrevrange(`bull:${queueName}:failed`, 0, 99, 'WITHSCORES'),
+      ]);
+
+      // Parse results (Redis returns [id1, score1, id2, score2, ...])
+      const completedJobs: Array<{ id: string; timestamp: number }> = [];
+      for (let i = 0; i < completedWithScores.length; i += 2) {
+        completedJobs.push({
+          id: completedWithScores[i],
+          timestamp: parseFloat(completedWithScores[i + 1]),
+        });
+      }
+
+      const failedJobs: Array<{ id: string; timestamp: number }> = [];
+      for (let i = 0; i < failedWithScores.length; i += 2) {
+        failedJobs.push({
+          id: failedWithScores[i],
+          timestamp: parseFloat(failedWithScores[i + 1]),
+        });
+      }
+
+      // Calculate throughput (jobs/hour) from jobs in the last hour
+      const now = Date.now();
+      const oneHourAgo = now - 60 * 60 * 1000;
+
+      const recentCompleted = completedJobs.filter(
+        (job) => job.timestamp >= oneHourAgo
+      );
+      const recentFailed = failedJobs.filter(
+        (job) => job.timestamp >= oneHourAgo
+      );
+
+      const throughput = recentCompleted.length + recentFailed.length;
+
+      // Calculate failure rate (failed / total)
+      const totalJobs = completedJobs.length + failedJobs.length;
+      const failureRate = totalJobs > 0 ? failedJobs.length / totalJobs : 0;
+
+      // Calculate average processing time from completed jobs
+      // Need to fetch job data to get processedOn and finishedOn timestamps
+      let totalProcessingTime = 0;
+      let processedJobCount = 0;
+
+      // Fetch full job data for completed jobs to calculate processing time
+      for (const job of completedJobs) {
+        const jobDataResult = await this.fetchJobData(
+          queueName,
+          job.id,
+          JobStatus.Completed
+        );
+
+        if (
+          jobDataResult.ok &&
+          jobDataResult.value.processedOn !== null &&
+          jobDataResult.value.finishedOn !== null
+        ) {
+          const processingTime =
+            jobDataResult.value.finishedOn - jobDataResult.value.processedOn;
+          totalProcessingTime += processingTime;
+          processedJobCount++;
+        }
+      }
+
+      const avgProcessingTime =
+        processedJobCount > 0 ? totalProcessingTime / processedJobCount : 0;
+
+      return Ok({
+        throughput,
+        failureRate,
+        avgProcessingTime,
+      });
+    } catch (error) {
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   /**
