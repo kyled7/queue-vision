@@ -1930,6 +1930,759 @@ describe('BullMQAdapter', () => {
     });
   });
 
-  // Additional test suites will be added in subsequent subtasks:
-  // - subtask-12-6: subscribe tests
+  describe('subscribe', () => {
+    it('should successfully subscribe to keyspace notifications', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Create a second mock Redis client for subscriber
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      // Mock Redis constructor to return subscriber on second call
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis; // First call (connect)
+        if (callCount === 2) return mockSubscriber; // Second call (subscribe)
+        return createMockRedis();
+      });
+
+      // Reconnect to reset call count properly
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      const result = await adapter.subscribe(callback);
+
+      expect(result.ok).toBe(true);
+      expect(mockSubscriber.psubscribe).toHaveBeenCalledWith('__keyspace@0__:bull:*');
+      expect(mockSubscriber.on).toHaveBeenCalledWith('pmessage', expect.any(Function));
+    });
+
+    it('should subscribe with correct database pattern', async () => {
+      mockSuccessfulConnection(mockRedis);
+
+      // Mock client options to use database 2
+      mockRedis.options = {
+        host: 'localhost',
+        port: 6379,
+        db: 2,
+      };
+
+      await adapter.connect('redis://localhost:6379/2');
+
+      // Create subscriber mock
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      mockRedis.options.db = 2;
+      await adapter.connect('redis://localhost:6379/2');
+
+      const callback = jest.fn();
+      const result = await adapter.subscribe(callback);
+
+      expect(result.ok).toBe(true);
+      expect(mockSubscriber.psubscribe).toHaveBeenCalledWith('__keyspace@2__:bull:*');
+    });
+
+    it('should return error when not connected', async () => {
+      const callback = jest.fn();
+      const result = await adapter.subscribe(callback);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Not connected to Redis');
+      }
+    });
+
+    it('should return error when already subscribed', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Setup subscriber mock
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+
+      // First subscription should succeed
+      const result1 = await adapter.subscribe(callback);
+      expect(result1.ok).toBe(true);
+
+      // Second subscription should fail
+      const result2 = await adapter.subscribe(callback);
+      expect(result2.ok).toBe(false);
+      if (!result2.ok) {
+        expect(result2.error.message).toContain('Already subscribed');
+      }
+    });
+
+    it('should handle subscriber connection failure', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Create subscriber mock that fails to connect
+      const mockSubscriber = createMockRedis();
+      const connectionError = new Error('Connection refused');
+      mockSubscriber.once.mockImplementation((event: string, callback: (err?: Error) => void) => {
+        if (event === 'error') {
+          setImmediate(() => callback(connectionError));
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      const result = await adapter.subscribe(callback);
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe(connectionError);
+      }
+      expect(mockSubscriber.disconnect).toHaveBeenCalled();
+    });
+
+    it('should parse job hash update events correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      // Capture the pmessage handler
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job hash update (hset operation)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:myqueue:123',
+        'hset'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'updated',
+        queueName: 'myqueue',
+        jobId: '123',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should parse job deletion events correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job deletion (del operation)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:myqueue:456',
+        'del'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'removed',
+        queueName: 'myqueue',
+        jobId: '456',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should parse waiting queue events correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job added to waiting queue (lpush operation)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:myqueue:wait',
+        'lpush'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'waiting',
+        queueName: 'myqueue',
+        jobId: '',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should parse active queue events correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job moved to active (rpush operation)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:testqueue:active',
+        'rpush'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'active',
+        queueName: 'testqueue',
+        jobId: '',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should parse completed queue events correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job completed (zadd operation on completed set)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:processqueue:completed',
+        'zadd'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'completed',
+        queueName: 'processqueue',
+        jobId: '',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should parse failed queue events correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job failed (zadd operation on failed set)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:errorqueue:failed',
+        'zadd'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'failed',
+        queueName: 'errorqueue',
+        jobId: '',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should parse delayed queue events correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate delayed job (zadd operation on delayed set)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:scheduledqueue:delayed',
+        'zadd'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'delayed',
+        queueName: 'scheduledqueue',
+        jobId: '',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should ignore meta key events', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate meta key update (should be ignored)
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:myqueue:meta',
+        'hset'
+      );
+
+      // Callback should not be invoked for meta keys
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it('should handle job IDs with colons', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job with colon in ID
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:myqueue:job:with:colons:123',
+        'hset'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'updated',
+        queueName: 'myqueue',
+        jobId: 'job:with:colons:123',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should handle hmset operation as update', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate hmset operation
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:myqueue:999',
+        'hmset'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'updated',
+        queueName: 'myqueue',
+        jobId: '999',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should handle lrem operation on wait queue', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate job removed from wait queue
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:bull:testqueue:wait',
+        'lrem'
+      );
+
+      expect(callback).toHaveBeenCalledWith({
+        eventType: 'dequeued',
+        queueName: 'testqueue',
+        jobId: '',
+        timestamp: expect.any(Number),
+      });
+    });
+
+    it('should not invoke callback on parsing errors', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const mockSubscriber = createMockRedis();
+      mockSubscriber.once.mockImplementation((event: string, callback: () => void) => {
+        if (event === 'ready') {
+          setImmediate(() => callback());
+        }
+        return mockSubscriber;
+      });
+
+      let pmessageHandler: (pattern: string, channel: string, message: string) => void;
+      mockSubscriber.on.mockImplementation((event: string, handler: any) => {
+        if (event === 'pmessage') {
+          pmessageHandler = handler;
+        }
+        return mockSubscriber;
+      });
+
+      let callCount = 0;
+      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+        callCount++;
+        if (callCount === 1) return mockRedis;
+        if (callCount === 2) return mockSubscriber;
+        return createMockRedis();
+      });
+
+      await adapter.disconnect();
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const callback = jest.fn();
+      await adapter.subscribe(callback);
+
+      // Simulate invalid channel format
+      pmessageHandler!(
+        '__keyspace@0__:bull:*',
+        '__keyspace@0__:invalid:format',
+        'set'
+      );
+
+      // Callback should not be invoked for invalid events
+      expect(callback).not.toHaveBeenCalled();
+    });
+  });
 });
