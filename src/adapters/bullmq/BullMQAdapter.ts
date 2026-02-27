@@ -162,27 +162,32 @@ export class BullMQAdapter implements QueueAdapter {
         return Ok(undefined);
       }
 
+      // Keep references for error handling
+      const subscriberRef = this.subscriber;
+      const clientRef = this.client;
+
       // Cleanup subscriber first (if exists)
-      if (this.subscriber) {
+      if (subscriberRef) {
         try {
           // Unsubscribe from all patterns
-          await this.subscriber.punsubscribe();
+          await subscriberRef.punsubscribe();
           // Close subscriber connection
-          await this.subscriber.quit();
+          await subscriberRef.quit();
         } catch (subError) {
           // Force disconnect on error
-          this.subscriber.disconnect();
-        } finally {
-          this.subscriber = null;
+          subscriberRef.disconnect();
         }
       }
 
       // Cleanup primary client
-      if (this.client) {
+      if (clientRef) {
         // Gracefully close Redis connection (waits for pending commands)
-        await this.client.quit();
-        this.client = null;
+        await clientRef.quit();
       }
+
+      // Only clear references after successful cleanup of both
+      this.subscriber = null;
+      this.client = null;
 
       return Ok(undefined);
     } catch (error) {

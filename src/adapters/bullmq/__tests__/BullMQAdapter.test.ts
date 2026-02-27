@@ -1480,7 +1480,6 @@ describe('BullMQAdapter', () => {
       await adapter.connect('redis://localhost:6379');
 
       const now = Date.now();
-      const oneHourAgo = now - 60 * 60 * 1000;
       const twoHoursAgo = now - 2 * 60 * 60 * 1000;
 
       // Mock completed jobs: 3 in last hour, 1 older
@@ -1689,8 +1688,7 @@ describe('BullMQAdapter', () => {
         return Promise.resolve([]);
       });
 
-      mockRedis.hgetall.mockImplementation((key: string) => {
-        const jobId = key.split(':').pop();
+      mockRedis.hgetall.mockImplementation((_key: string) => {
         return Promise.resolve({
           data: '{}',
           timestamp: String(now - 10000),
@@ -1870,7 +1868,7 @@ describe('BullMQAdapter', () => {
         return Promise.resolve([]);
       });
 
-      mockRedis.hgetall.mockImplementation((key: string) => {
+      mockRedis.hgetall.mockImplementation((_key: string) => {
         return Promise.resolve({
           data: '{}',
           timestamp: String(now - 10000),
@@ -1910,7 +1908,7 @@ describe('BullMQAdapter', () => {
         return Promise.resolve([]);
       });
 
-      mockRedis.hgetall.mockImplementation((key: string) => {
+      mockRedis.hgetall.mockImplementation((_key: string) => {
         return Promise.resolve({
           data: '{}',
           timestamp: String(now - 10000),
@@ -1946,7 +1944,7 @@ describe('BullMQAdapter', () => {
 
       // Mock Redis constructor to return subscriber on second call
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis; // First call (connect)
         if (callCount === 2) return mockSubscriber; // Second call (subscribe)
@@ -1988,7 +1986,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2031,7 +2029,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2071,7 +2069,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2114,7 +2112,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2164,7 +2162,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2214,7 +2212,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2264,7 +2262,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2314,7 +2312,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2364,7 +2362,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2414,7 +2412,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2464,7 +2462,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2510,7 +2508,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2560,7 +2558,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2610,7 +2608,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
@@ -2660,7 +2658,7 @@ describe('BullMQAdapter', () => {
       });
 
       let callCount = 0;
-      (Redis as unknown as jest.Mock).mockImplementation((config?: any) => {
+      (Redis as unknown as jest.Mock).mockImplementation((_config?: any) => {
         callCount++;
         if (callCount === 1) return mockRedis;
         if (callCount === 2) return mockSubscriber;
