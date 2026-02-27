@@ -144,7 +144,25 @@ export class BullMQAdapter implements QueueAdapter {
    * @returns Result<void, Error> - Ok if disconnection successful, Err if cleanup failed
    */
   async disconnect(): Promise<Result<void, Error>> {
-    return Err(new Error('Not implemented'));
+    try {
+      // No client to disconnect - already disconnected or never connected
+      if (!this.client) {
+        return Ok(undefined);
+      }
+
+      // Gracefully close Redis connection (waits for pending commands)
+      await this.client.quit();
+      this.client = null;
+
+      return Ok(undefined);
+    } catch (error) {
+      // Fallback to forceful disconnect on error
+      if (this.client) {
+        this.client.disconnect();
+        this.client = null;
+      }
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   /**
