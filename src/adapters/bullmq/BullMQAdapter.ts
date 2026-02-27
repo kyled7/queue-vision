@@ -66,6 +66,14 @@ export class BullMQAdapter implements QueueAdapter {
   private client: Redis | null = null;
 
   /**
+   * Redis subscriber client for keyspace notifications.
+   *
+   * Created when subscribe() is called, null before subscription.
+   * Separate from primary client as pub/sub clients cannot execute regular commands.
+   */
+  private subscriber: Redis | null = null;
+
+  /**
    * Create a new BullMQAdapter instance.
    *
    * The adapter starts unconnected. Call connect() before using other methods.
@@ -145,18 +153,44 @@ export class BullMQAdapter implements QueueAdapter {
    */
   async disconnect(): Promise<Result<void, Error>> {
     try {
-      // No client to disconnect - already disconnected or never connected
-      if (!this.client) {
+      // Track if we had any connections to clean up
+      const hadClient = this.client !== null;
+      const hadSubscriber = this.subscriber !== null;
+
+      // No connections to disconnect
+      if (!hadClient && !hadSubscriber) {
         return Ok(undefined);
       }
 
-      // Gracefully close Redis connection (waits for pending commands)
-      await this.client.quit();
-      this.client = null;
+      // Cleanup subscriber first (if exists)
+      if (this.subscriber) {
+        try {
+          // Unsubscribe from all patterns
+          await this.subscriber.punsubscribe();
+          // Close subscriber connection
+          await this.subscriber.quit();
+        } catch (subError) {
+          // Force disconnect on error
+          this.subscriber.disconnect();
+        } finally {
+          this.subscriber = null;
+        }
+      }
+
+      // Cleanup primary client
+      if (this.client) {
+        // Gracefully close Redis connection (waits for pending commands)
+        await this.client.quit();
+        this.client = null;
+      }
 
       return Ok(undefined);
     } catch (error) {
       // Fallback to forceful disconnect on error
+      if (this.subscriber) {
+        this.subscriber.disconnect();
+        this.subscriber = null;
+      }
       if (this.client) {
         this.client.disconnect();
         this.client = null;
@@ -578,6 +612,186 @@ export class BullMQAdapter implements QueueAdapter {
    * @returns Result<void, Error> - Ok if subscription successful, Err if setup failed
    */
   async subscribe(callback: JobEventCallback): Promise<Result<void, Error>> {
-    return Err(new Error('Not implemented'));
+    try {
+      // Verify Redis connection is established
+      if (!this.client) {
+        return Err(new Error('Not connected to Redis. Call connect() first.'));
+      }
+
+      // Avoid duplicate subscriptions
+      if (this.subscriber) {
+        return Err(
+          new Error('Already subscribed. Call disconnect() to unsubscribe.')
+        );
+      }
+
+      // Create separate subscriber client (pub/sub clients can't run regular commands)
+      // Clone connection options from primary client
+      const options = this.client.options;
+      this.subscriber = new Redis({
+        host: options.host,
+        port: options.port,
+        db: options.db,
+        password: options.password,
+        maxRetriesPerRequest: null,
+      });
+
+      // Wait for subscriber to be ready
+      await new Promise<void>((resolve, reject) => {
+        if (!this.subscriber) {
+          reject(new Error('Subscriber initialization failed'));
+          return;
+        }
+
+        this.subscriber.once('ready', () => resolve());
+        this.subscriber.once('error', (error: Error) => reject(error));
+      });
+
+      // Subscribe to keyspace notifications for all bull:* keys
+      // Pattern: __keyspace@0__:bull:* (db 0 is default, adjust if using different db)
+      const db = options.db || 0;
+      const pattern = `__keyspace@${db}__:bull:*`;
+
+      await this.subscriber.psubscribe(pattern);
+
+      // Set up event handler for keyspace notifications
+      this.subscriber.on('pmessage', (pattern: string, channel: string, message: string) => {
+        try {
+          // Parse keyspace notification
+          // Channel format: __keyspace@0__:bull:{queueName}:{key}
+          // Message: operation type (e.g., "set", "del", "lpush", "zadd")
+
+          const event = this.parseKeyspaceEvent(channel, message);
+          if (event) {
+            callback(event);
+          }
+        } catch (error) {
+          // Log error but don't throw - don't want to break subscription
+          // In production, could emit error events or use logging framework
+        }
+      });
+
+      return Ok(undefined);
+    } catch (error) {
+      // Cleanup on subscription failure
+      if (this.subscriber) {
+        this.subscriber.disconnect();
+        this.subscriber = null;
+      }
+      return Err(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  /**
+   * Parse Redis keyspace notification into JobEvent.
+   *
+   * Extracts queue name, job ID, and event type from keyspace notification channel and message.
+   * Returns null if the notification doesn't match expected BullMQ patterns.
+   *
+   * @param channel - Keyspace notification channel (e.g., __keyspace@0__:bull:myqueue:123)
+   * @param message - Operation type (e.g., "set", "del", "lpush", "zadd")
+   * @returns JobEvent if parseable, null if not a relevant BullMQ event
+   */
+  private parseKeyspaceEvent(
+    channel: string,
+    message: string
+  ): JobEvent | null {
+    // Extract key from channel: __keyspace@0__:bull:{queueName}:{key}
+    const keyMatch = channel.match(/^__keyspace@\d+__:bull:(.+)$/);
+    if (!keyMatch) return null;
+
+    const keyPart = keyMatch[1]; // e.g., "myqueue:123" or "myqueue:wait"
+
+    // Split into queue name and key suffix
+    const parts = keyPart.split(':');
+    if (parts.length < 2) return null;
+
+    const queueName = parts[0];
+    const keySuffix = parts.slice(1).join(':'); // Handle job IDs with colons
+
+    // Determine event type based on key pattern and operation
+    let eventType: string;
+    let jobId: string;
+
+    // Job-specific events (bull:{queue}:{jobId})
+    if (keySuffix !== 'wait' &&
+        keySuffix !== 'active' &&
+        keySuffix !== 'completed' &&
+        keySuffix !== 'failed' &&
+        keySuffix !== 'delayed' &&
+        keySuffix !== 'meta') {
+      // This is a job hash (bull:{queue}:{jobId})
+      jobId = keySuffix;
+
+      // Map Redis operation to BullMQ event
+      switch (message) {
+        case 'hset':
+        case 'hmset':
+          eventType = 'updated';
+          break;
+        case 'del':
+          eventType = 'removed';
+          break;
+        default:
+          eventType = message; // Use raw operation as fallback
+      }
+    }
+    // Queue list/set events (bull:{queue}:wait, etc.)
+    else {
+      // For list/set operations, infer job state changes
+      // Note: We can't reliably extract job ID from list operations without additional queries
+      // So we use a generic event with empty job ID
+      jobId = '';
+
+      switch (keySuffix) {
+        case 'wait':
+          if (message === 'lpush' || message === 'rpush') {
+            eventType = 'waiting';
+          } else if (message === 'lrem') {
+            eventType = 'dequeued';
+          } else {
+            eventType = message;
+          }
+          break;
+        case 'active':
+          if (message === 'lpush' || message === 'rpush') {
+            eventType = 'active';
+          } else {
+            eventType = message;
+          }
+          break;
+        case 'completed':
+          if (message === 'zadd') {
+            eventType = 'completed';
+          } else {
+            eventType = message;
+          }
+          break;
+        case 'failed':
+          if (message === 'zadd') {
+            eventType = 'failed';
+          } else {
+            eventType = message;
+          }
+          break;
+        case 'delayed':
+          if (message === 'zadd') {
+            eventType = 'delayed';
+          } else {
+            eventType = message;
+          }
+          break;
+        default:
+          // Other BullMQ keys (meta, etc.) - ignore or use raw operation
+          return null;
+      }
+    }
+
+    return {
+      eventType,
+      queueName,
+      jobId,
+      timestamp: Date.now(),
+    };
   }
 }
