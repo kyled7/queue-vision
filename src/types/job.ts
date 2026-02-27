@@ -5,6 +5,44 @@
  */
 
 /**
+ * Enumeration of possible job statuses in BullMQ.
+ *
+ * @example
+ * ```typescript
+ * const status: JobStatus = JobStatus.Completed;
+ * if (job.status === JobStatus.Failed) {
+ *   console.log('Job failed:', job.error);
+ * }
+ * ```
+ */
+export enum JobStatus {
+  /**
+   * Job is waiting in the queue to be processed.
+   */
+  Waiting = "waiting",
+
+  /**
+   * Job is currently being processed by a worker.
+   */
+  Active = "active",
+
+  /**
+   * Job has completed successfully.
+   */
+  Completed = "completed",
+
+  /**
+   * Job has failed after all retry attempts.
+   */
+  Failed = "failed",
+
+  /**
+   * Job is delayed and scheduled for future execution.
+   */
+  Delayed = "delayed",
+}
+
+/**
  * Represents a BullMQ job with its data, status, error information, and execution metadata.
  *
  * Jobs contain the work payload, current execution state, error details (if failed),
@@ -47,10 +85,8 @@ export interface Job {
 
   /**
    * The current status of the job.
-   *
-   * Possible values: "waiting", "active", "completed", "failed", "delayed"
    */
-  readonly status: string;
+  readonly status: JobStatus;
 
   /**
    * Error message if the job failed, null otherwise.
@@ -115,4 +151,44 @@ export interface Job {
    * Only applicable for jobs in the "delayed" status.
    */
   readonly delay?: number;
+}
+
+/**
+ * Represents a real-time event notification for job state changes.
+ *
+ * JobEvents are emitted by the subscribe() method when Redis keyspace notifications
+ * detect changes to BullMQ job keys. These enable real-time monitoring of queue activity.
+ *
+ * @example
+ * ```typescript
+ * adapter.subscribe((event: JobEvent) => {
+ *   console.log(`Job ${event.jobId} in ${event.queueName}: ${event.eventType}`);
+ *   if (event.eventType === 'failed') {
+ *     // Handle job failure
+ *   }
+ * });
+ * ```
+ */
+export interface JobEvent {
+  /**
+   * The type of event that occurred.
+   *
+   * Common values: "added", "completed", "failed", "active", "delayed", "removed"
+   */
+  readonly eventType: string;
+
+  /**
+   * The name of the queue where the event occurred.
+   */
+  readonly queueName: string;
+
+  /**
+   * The unique identifier of the job that triggered the event.
+   */
+  readonly jobId: string;
+
+  /**
+   * Unix timestamp (milliseconds) when the event was detected.
+   */
+  readonly timestamp: number;
 }
