@@ -25,7 +25,7 @@ import {
 } from '../QueueAdapter';
 import { Result } from '../../types/result';
 import { Queue, ConnectionInfo } from '../../types/queue';
-import { Job, JobStatus } from '../../types/job';
+import { Job, JobStatus, JobEvent } from '../../types/job';
 import { Ok, Err } from '../../utils/result';
 
 /**
@@ -236,7 +236,7 @@ export class BullMQAdapter implements QueueAdapter {
       for (const metaKey of metaKeys) {
         // Extract queue name from bull:{queueName}:meta pattern
         const match = metaKey.match(/^bull:(.+):meta$/);
-        if (!match) continue;
+        if (!match || !match[1]) continue;
 
         const queueName = match[1];
 
@@ -409,25 +409,25 @@ export class BullMQAdapter implements QueueAdapter {
       const job: Job = {
         id: jobId,
         queueName,
-        data: jobData.data ? JSON.parse(jobData.data) : null,
+        data: jobData['data'] ? JSON.parse(jobData['data']) : null,
         status,
-        error: jobData.failedReason || null,
-        stacktrace: jobData.stacktrace ? JSON.parse(jobData.stacktrace) : null,
-        attempts: parseInt(jobData.attemptsMade || '0', 10),
-        maxAttempts: jobData.opts
-          ? JSON.parse(jobData.opts).attempts
+        error: jobData['failedReason'] || null,
+        stacktrace: jobData['stacktrace'] ? JSON.parse(jobData['stacktrace']) : null,
+        attempts: parseInt(jobData['attemptsMade'] || '0', 10),
+        maxAttempts: jobData['opts']
+          ? JSON.parse(jobData['opts']).attempts
           : undefined,
-        timestamp: parseInt(jobData.timestamp || '0', 10),
-        processedOn: jobData.processedOn
-          ? parseInt(jobData.processedOn, 10)
+        timestamp: parseInt(jobData['timestamp'] || '0', 10),
+        processedOn: jobData['processedOn']
+          ? parseInt(jobData['processedOn'], 10)
           : null,
-        finishedOn: jobData.finishedOn
-          ? parseInt(jobData.finishedOn, 10)
+        finishedOn: jobData['finishedOn']
+          ? parseInt(jobData['finishedOn'], 10)
           : null,
-        returnvalue: jobData.returnvalue
-          ? JSON.parse(jobData.returnvalue)
+        returnvalue: jobData['returnvalue']
+          ? JSON.parse(jobData['returnvalue'])
           : undefined,
-        delay: jobData.delay ? parseInt(jobData.delay, 10) : undefined,
+        delay: jobData['delay'] ? parseInt(jobData['delay'], 10) : undefined,
       };
 
       return Ok(job);
@@ -533,18 +533,26 @@ export class BullMQAdapter implements QueueAdapter {
       // Parse results (Redis returns [id1, score1, id2, score2, ...])
       const completedJobs: Array<{ id: string; timestamp: number }> = [];
       for (let i = 0; i < completedWithScores.length; i += 2) {
-        completedJobs.push({
-          id: completedWithScores[i],
-          timestamp: parseFloat(completedWithScores[i + 1]),
-        });
+        const id = completedWithScores[i];
+        const score = completedWithScores[i + 1];
+        if (id && score) {
+          completedJobs.push({
+            id,
+            timestamp: parseFloat(score),
+          });
+        }
       }
 
       const failedJobs: Array<{ id: string; timestamp: number }> = [];
       for (let i = 0; i < failedWithScores.length; i += 2) {
-        failedJobs.push({
-          id: failedWithScores[i],
-          timestamp: parseFloat(failedWithScores[i + 1]),
-        });
+        const id = failedWithScores[i];
+        const score = failedWithScores[i + 1];
+        if (id && score) {
+          failedJobs.push({
+            id,
+            timestamp: parseFloat(score),
+          });
+        }
       }
 
       // Calculate throughput (jobs/hour) from jobs in the last hour
@@ -655,7 +663,7 @@ export class BullMQAdapter implements QueueAdapter {
       await this.subscriber.psubscribe(pattern);
 
       // Set up event handler for keyspace notifications
-      this.subscriber.on('pmessage', (pattern: string, channel: string, message: string) => {
+      this.subscriber.on('pmessage', (_pattern: string, channel: string, message: string) => {
         try {
           // Parse keyspace notification
           // Channel format: __keyspace@0__:bull:{queueName}:{key}
@@ -698,13 +706,13 @@ export class BullMQAdapter implements QueueAdapter {
   ): JobEvent | null {
     // Extract key from channel: __keyspace@0__:bull:{queueName}:{key}
     const keyMatch = channel.match(/^__keyspace@\d+__:bull:(.+)$/);
-    if (!keyMatch) return null;
+    if (!keyMatch || !keyMatch[1]) return null;
 
     const keyPart = keyMatch[1]; // e.g., "myqueue:123" or "myqueue:wait"
 
     // Split into queue name and key suffix
     const parts = keyPart.split(':');
-    if (parts.length < 2) return null;
+    if (parts.length < 2 || !parts[0]) return null;
 
     const queueName = parts[0];
     const keySuffix = parts.slice(1).join(':'); // Handle job IDs with colons

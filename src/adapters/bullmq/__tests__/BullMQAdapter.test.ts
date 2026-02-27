@@ -6,7 +6,6 @@
  */
 
 import { BullMQAdapter } from '../BullMQAdapter';
-import { JobStatus } from '../../../types/job';
 import Redis from 'ioredis';
 
 // Mock ioredis module
@@ -368,8 +367,382 @@ describe('BullMQAdapter', () => {
     });
   });
 
+  describe('listQueues', () => {
+    it('should return empty array when no queues exist', async () => {
+      // Connect first
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock scan to return no keys
+      mockRedis.scan.mockResolvedValue(['0', []]);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toEqual([]);
+      }
+      expect(mockRedis.scan).toHaveBeenCalledWith(
+        '0',
+        'MATCH',
+        'bull:*:meta',
+        'COUNT',
+        '100'
+      );
+    });
+
+    it('should discover single queue with accurate job counts', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock scan to return one queue meta key
+      mockRedis.scan.mockResolvedValue(['0', ['bull:email-queue:meta']]);
+
+      // Mock job count queries
+      mockRedis.llen.mockImplementation((key: string) => {
+        if (key === 'bull:email-queue:wait') return Promise.resolve(5);
+        if (key === 'bull:email-queue:active') return Promise.resolve(2);
+        return Promise.resolve(0);
+      });
+
+      mockRedis.zcard.mockImplementation((key: string) => {
+        if (key === 'bull:email-queue:completed') return Promise.resolve(100);
+        if (key === 'bull:email-queue:failed') return Promise.resolve(3);
+        if (key === 'bull:email-queue:delayed') return Promise.resolve(0);
+        return Promise.resolve(0);
+      });
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(1);
+        expect(result.value[0]).toEqual({
+          name: 'email-queue',
+          waiting: 5,
+          active: 2,
+          completed: 100,
+          failed: 3,
+          delayed: 0,
+          connection: {
+            host: 'localhost',
+            port: 6379,
+          },
+        });
+      }
+
+      // Verify parallel job count queries
+      expect(mockRedis.llen).toHaveBeenCalledWith('bull:email-queue:wait');
+      expect(mockRedis.llen).toHaveBeenCalledWith('bull:email-queue:active');
+      expect(mockRedis.zcard).toHaveBeenCalledWith('bull:email-queue:completed');
+      expect(mockRedis.zcard).toHaveBeenCalledWith('bull:email-queue:failed');
+      expect(mockRedis.zcard).toHaveBeenCalledWith('bull:email-queue:delayed');
+    });
+
+    it('should discover multiple queues with different job counts', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock scan to return multiple queue meta keys
+      mockRedis.scan.mockResolvedValue([
+        '0',
+        ['bull:email-queue:meta', 'bull:video-processing:meta', 'bull:notifications:meta'],
+      ]);
+
+      // Mock job counts for different queues
+      mockRedis.llen.mockImplementation((key: string) => {
+        if (key === 'bull:email-queue:wait') return Promise.resolve(10);
+        if (key === 'bull:email-queue:active') return Promise.resolve(1);
+        if (key === 'bull:video-processing:wait') return Promise.resolve(0);
+        if (key === 'bull:video-processing:active') return Promise.resolve(5);
+        if (key === 'bull:notifications:wait') return Promise.resolve(50);
+        if (key === 'bull:notifications:active') return Promise.resolve(0);
+        return Promise.resolve(0);
+      });
+
+      mockRedis.zcard.mockImplementation((key: string) => {
+        if (key === 'bull:email-queue:completed') return Promise.resolve(200);
+        if (key === 'bull:email-queue:failed') return Promise.resolve(2);
+        if (key === 'bull:email-queue:delayed') return Promise.resolve(0);
+        if (key === 'bull:video-processing:completed') return Promise.resolve(50);
+        if (key === 'bull:video-processing:failed') return Promise.resolve(10);
+        if (key === 'bull:video-processing:delayed') return Promise.resolve(3);
+        if (key === 'bull:notifications:completed') return Promise.resolve(1000);
+        if (key === 'bull:notifications:failed') return Promise.resolve(0);
+        if (key === 'bull:notifications:delayed') return Promise.resolve(25);
+        return Promise.resolve(0);
+      });
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(3);
+
+        // Verify email-queue
+        const emailQueue = result.value.find((q) => q.name === 'email-queue');
+        expect(emailQueue).toEqual({
+          name: 'email-queue',
+          waiting: 10,
+          active: 1,
+          completed: 200,
+          failed: 2,
+          delayed: 0,
+          connection: {
+            host: 'localhost',
+            port: 6379,
+          },
+        });
+
+        // Verify video-processing queue
+        const videoQueue = result.value.find((q) => q.name === 'video-processing');
+        expect(videoQueue).toEqual({
+          name: 'video-processing',
+          waiting: 0,
+          active: 5,
+          completed: 50,
+          failed: 10,
+          delayed: 3,
+          connection: {
+            host: 'localhost',
+            port: 6379,
+          },
+        });
+
+        // Verify notifications queue
+        const notifQueue = result.value.find((q) => q.name === 'notifications');
+        expect(notifQueue).toEqual({
+          name: 'notifications',
+          waiting: 50,
+          active: 0,
+          completed: 1000,
+          failed: 0,
+          delayed: 25,
+          connection: {
+            host: 'localhost',
+            port: 6379,
+          },
+        });
+      }
+    });
+
+    it('should handle paginated SCAN results correctly', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock scan to return results across multiple pages
+      let scanCallCount = 0;
+      mockRedis.scan.mockImplementation((cursor: string) => {
+        scanCallCount++;
+        if (cursor === '0' && scanCallCount === 1) {
+          // First call: return cursor for next page
+          return Promise.resolve(['123', ['bull:queue1:meta', 'bull:queue2:meta']]);
+        } else if (cursor === '123') {
+          // Second call: return final page
+          return Promise.resolve(['0', ['bull:queue3:meta']]);
+        }
+        return Promise.resolve(['0', []]);
+      });
+
+      // Mock job counts (all zeros for simplicity)
+      mockRedis.llen.mockResolvedValue(0);
+      mockRedis.zcard.mockResolvedValue(0);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(3);
+        expect(result.value.map((q) => q.name).sort()).toEqual([
+          'queue1',
+          'queue2',
+          'queue3',
+        ]);
+      }
+
+      // Verify scan was called twice
+      expect(mockRedis.scan).toHaveBeenCalledTimes(2);
+      expect(mockRedis.scan).toHaveBeenNthCalledWith(
+        1,
+        '0',
+        'MATCH',
+        'bull:*:meta',
+        'COUNT',
+        '100'
+      );
+      expect(mockRedis.scan).toHaveBeenNthCalledWith(
+        2,
+        '123',
+        'MATCH',
+        'bull:*:meta',
+        'COUNT',
+        '100'
+      );
+    });
+
+    it('should include database number in connection info when non-zero', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379/2');
+
+      // Update mock Redis client options to include db
+      mockRedis.options.db = 2;
+
+      mockRedis.scan.mockResolvedValue(['0', ['bull:test-queue:meta']]);
+      mockRedis.llen.mockResolvedValue(0);
+      mockRedis.zcard.mockResolvedValue(0);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(1);
+        expect(result.value[0]).toBeDefined();
+        expect(result.value[0]!.connection).toEqual({
+          host: 'localhost',
+          port: 6379,
+          db: 2,
+        });
+      }
+    });
+
+    it('should skip keys that do not match bull:*:meta pattern', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock scan to return invalid keys mixed with valid ones
+      mockRedis.scan.mockResolvedValue([
+        '0',
+        [
+          'bull:valid-queue:meta',
+          'bull:another-queue:wait', // Not a meta key
+          'other-prefix:queue:meta', // Wrong prefix
+          'bull::meta', // Empty queue name
+        ],
+      ]);
+
+      mockRedis.llen.mockResolvedValue(0);
+      mockRedis.zcard.mockResolvedValue(0);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Should only process valid meta key
+        expect(result.value).toHaveLength(1);
+        expect(result.value[0]).toBeDefined();
+        expect(result.value[0]!.name).toBe('valid-queue');
+      }
+    });
+
+    it('should return error when not connected', async () => {
+      // Don't connect, just call listQueues
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Not connected to Redis');
+      }
+
+      // Should not attempt any Redis operations
+      expect(mockRedis.scan).not.toHaveBeenCalled();
+    });
+
+    it('should handle Redis scan failure', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock scan to throw error
+      const scanError = new Error('Redis connection lost');
+      mockRedis.scan.mockRejectedValue(scanError);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe(scanError);
+      }
+    });
+
+    it('should handle job count query failure', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      mockRedis.scan.mockResolvedValue(['0', ['bull:test-queue:meta']]);
+
+      // Mock llen to throw error
+      const countError = new Error('LLEN operation failed');
+      mockRedis.llen.mockRejectedValue(countError);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('LLEN operation failed');
+      }
+    });
+
+    it('should handle queue names with special characters', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // Mock scan with queue names containing special characters
+      mockRedis.scan.mockResolvedValue([
+        '0',
+        [
+          'bull:my-queue-123:meta',
+          'bull:queue_with_underscores:meta',
+          'bull:queue.with.dots:meta',
+        ],
+      ]);
+
+      mockRedis.llen.mockResolvedValue(0);
+      mockRedis.zcard.mockResolvedValue(0);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(3);
+        expect(result.value.map((q) => q.name).sort()).toEqual([
+          'my-queue-123',
+          'queue.with.dots',
+          'queue_with_underscores',
+        ]);
+      }
+    });
+
+    it('should extract connection info from Redis client options', async () => {
+      mockSuccessfulConnection(mockRedis);
+
+      // Set custom connection info in mock
+      mockRedis.options = {
+        host: 'redis.example.com',
+        port: 6380,
+        db: 1,
+      };
+
+      await adapter.connect('redis://redis.example.com:6380/1');
+
+      mockRedis.scan.mockResolvedValue(['0', ['bull:test:meta']]);
+      mockRedis.llen.mockResolvedValue(0);
+      mockRedis.zcard.mockResolvedValue(0);
+
+      const result = await adapter.listQueues();
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.value).toHaveLength(1);
+        expect(result.value[0]).toBeDefined();
+        expect(result.value[0]!.connection).toEqual({
+          host: 'redis.example.com',
+          port: 6380,
+          db: 1,
+        });
+      }
+    });
+  });
+
   // Additional test suites will be added in subsequent subtasks:
-  // - subtask-12-3: listQueues tests
   // - subtask-12-4: getJobs/getJob tests
   // - subtask-12-5: getMetrics tests
   // - subtask-12-6: subscribe tests
