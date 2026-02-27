@@ -1474,7 +1474,462 @@ describe('BullMQAdapter', () => {
     });
   });
 
+  describe('getMetrics', () => {
+    it('should calculate metrics with completed and failed jobs', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+      const oneHourAgo = now - 60 * 60 * 1000;
+      const twoHoursAgo = now - 2 * 60 * 60 * 1000;
+
+      // Mock completed jobs: 3 in last hour, 1 older
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:completed') {
+          return Promise.resolve([
+            'job1', String(now - 1000),           // Recent
+            'job2', String(now - 30 * 60 * 1000), // Recent (30 min ago)
+            'job3', String(now - 45 * 60 * 1000), // Recent (45 min ago)
+            'job4', String(twoHoursAgo),          // Old (2 hours ago)
+          ]);
+        }
+        if (key === 'bull:test:failed') {
+          return Promise.resolve([
+            'job5', String(now - 15 * 60 * 1000), // Recent (15 min ago)
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      // Mock job data for processing time calculation
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        const jobId = key.split(':').pop();
+        if (jobId === 'job1') {
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 10000),
+            processedOn: String(now - 5000),
+            finishedOn: String(now - 1000),
+            attemptsMade: '1',
+          });
+        }
+        if (jobId === 'job2') {
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 40 * 60 * 1000),
+            processedOn: String(now - 35 * 60 * 1000),
+            finishedOn: String(now - 30 * 60 * 1000),
+            attemptsMade: '1',
+          });
+        }
+        if (jobId === 'job3') {
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 50 * 60 * 1000),
+            processedOn: String(now - 48 * 60 * 1000),
+            finishedOn: String(now - 45 * 60 * 1000),
+            attemptsMade: '1',
+          });
+        }
+        if (jobId === 'job4') {
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(twoHoursAgo - 10000),
+            processedOn: String(twoHoursAgo - 5000),
+            finishedOn: String(twoHoursAgo),
+            attemptsMade: '1',
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Throughput: 3 completed + 1 failed in last hour = 4 jobs/hour
+        expect(result.value.throughput).toBe(4);
+
+        // Failure rate: 1 failed / 5 total = 0.2 (20%)
+        expect(result.value.failureRate).toBeCloseTo(0.2);
+
+        // Average processing time: (4000 + 300000 + 180000 + 5000) / 4 = 122250ms
+        expect(result.value.avgProcessingTime).toBeCloseTo(122250);
+      }
+    });
+
+    it('should calculate metrics with no jobs', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      // No jobs at all
+      mockRedis.zrevrange.mockResolvedValue([]);
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // No jobs processed
+        expect(result.value.throughput).toBe(0);
+        expect(result.value.failureRate).toBe(0);
+        expect(result.value.avgProcessingTime).toBe(0);
+      }
+    });
+
+    it('should calculate metrics with only completed jobs', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+
+      // Mock 2 completed jobs, 0 failed
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:completed') {
+          return Promise.resolve([
+            'job1', String(now - 1000),
+            'job2', String(now - 2000),
+          ]);
+        }
+        return Promise.resolve([]); // No failed jobs
+      });
+
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        const jobId = key.split(':').pop();
+        if (jobId === 'job1') {
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 10000),
+            processedOn: String(now - 5000),
+            finishedOn: String(now - 1000),
+            attemptsMade: '1',
+          });
+        }
+        if (jobId === 'job2') {
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 20000),
+            processedOn: String(now - 12000),
+            finishedOn: String(now - 2000),
+            attemptsMade: '1',
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Throughput: 2 completed jobs in last hour
+        expect(result.value.throughput).toBe(2);
+
+        // Failure rate: 0 failed / 2 total = 0%
+        expect(result.value.failureRate).toBe(0);
+
+        // Average processing time: (4000 + 10000) / 2 = 7000ms
+        expect(result.value.avgProcessingTime).toBeCloseTo(7000);
+      }
+    });
+
+    it('should calculate metrics with only failed jobs', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+
+      // Mock 0 completed, 2 failed jobs
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:failed') {
+          return Promise.resolve([
+            'job1', String(now - 1000),
+            'job2', String(now - 2000),
+          ]);
+        }
+        return Promise.resolve([]); // No completed jobs
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Throughput: 2 failed jobs in last hour
+        expect(result.value.throughput).toBe(2);
+
+        // Failure rate: 2 failed / 2 total = 100%
+        expect(result.value.failureRate).toBe(1.0);
+
+        // Average processing time: 0 (no completed jobs to measure)
+        expect(result.value.avgProcessingTime).toBe(0);
+      }
+    });
+
+    it('should only count jobs from last hour for throughput', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+      const twoHoursAgo = now - 2 * 60 * 60 * 1000;
+      const threeDaysAgo = now - 3 * 24 * 60 * 60 * 1000;
+
+      // Mock jobs: some recent, some old
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:completed') {
+          return Promise.resolve([
+            'job1', String(now - 1000),      // Recent
+            'job2', String(twoHoursAgo),     // Old
+            'job3', String(threeDaysAgo),    // Very old
+          ]);
+        }
+        if (key === 'bull:test:failed') {
+          return Promise.resolve([
+            'job4', String(now - 30 * 60 * 1000), // Recent
+            'job5', String(twoHoursAgo),          // Old
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        const jobId = key.split(':').pop();
+        return Promise.resolve({
+          data: '{}',
+          timestamp: String(now - 10000),
+          processedOn: String(now - 5000),
+          finishedOn: String(now - 1000),
+          attemptsMade: '1',
+        });
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Throughput: only job1 and job4 are in last hour = 2 jobs/hour
+        expect(result.value.throughput).toBe(2);
+
+        // Failure rate uses all jobs: 2 failed / 5 total = 0.4 (40%)
+        expect(result.value.failureRate).toBeCloseTo(0.4);
+      }
+    });
+
+    it('should handle jobs with missing processing time fields', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:completed') {
+          return Promise.resolve([
+            'job1', String(now - 1000),
+            'job2', String(now - 2000),
+            'job3', String(now - 3000),
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        const jobId = key.split(':').pop();
+        if (jobId === 'job1') {
+          // Valid job with processing times
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 10000),
+            processedOn: String(now - 5000),
+            finishedOn: String(now - 1000),
+            attemptsMade: '1',
+          });
+        }
+        if (jobId === 'job2') {
+          // Missing finishedOn
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 10000),
+            processedOn: String(now - 5000),
+            attemptsMade: '1',
+          });
+        }
+        if (jobId === 'job3') {
+          // Missing processedOn
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 10000),
+            finishedOn: String(now - 3000),
+            attemptsMade: '1',
+          });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Only job1 has valid processing time: 4000ms
+        expect(result.value.avgProcessingTime).toBeCloseTo(4000);
+      }
+    });
+
+    it('should handle failed job data fetches gracefully', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:completed') {
+          return Promise.resolve([
+            'job1', String(now - 1000),
+            'job2', String(now - 2000),
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      // Mock hgetall to fail for job2
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        const jobId = key.split(':').pop();
+        if (jobId === 'job1') {
+          return Promise.resolve({
+            data: '{}',
+            timestamp: String(now - 10000),
+            processedOn: String(now - 5000),
+            finishedOn: String(now - 1000),
+            attemptsMade: '1',
+          });
+        }
+        if (jobId === 'job2') {
+          // Job deleted or unavailable
+          return Promise.resolve({});
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Should still calculate metrics with available job
+        expect(result.value.avgProcessingTime).toBeCloseTo(4000);
+      }
+    });
+
+    it('should return error when not connected', async () => {
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.message).toContain('Not connected to Redis');
+      }
+
+      expect(mockRedis.zrevrange).not.toHaveBeenCalled();
+    });
+
+    it('should handle Redis zrevrange failure', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const redisError = new Error('Redis command failed');
+      mockRedis.zrevrange.mockRejectedValue(redisError);
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error).toBe(redisError);
+      }
+    });
+
+    it('should calculate correct metrics with high failure rate', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+
+      // Mock 1 completed, 9 failed (90% failure rate)
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:completed') {
+          return Promise.resolve([
+            'job1', String(now - 1000),
+          ]);
+        }
+        if (key === 'bull:test:failed') {
+          return Promise.resolve([
+            'job2', String(now - 1000),
+            'job3', String(now - 2000),
+            'job4', String(now - 3000),
+            'job5', String(now - 4000),
+            'job6', String(now - 5000),
+            'job7', String(now - 6000),
+            'job8', String(now - 7000),
+            'job9', String(now - 8000),
+            'job10', String(now - 9000),
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        return Promise.resolve({
+          data: '{}',
+          timestamp: String(now - 10000),
+          processedOn: String(now - 5000),
+          finishedOn: String(now - 1000),
+          attemptsMade: '1',
+        });
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Throughput: 1 completed + 9 failed = 10 jobs/hour
+        expect(result.value.throughput).toBe(10);
+
+        // Failure rate: 9 failed / 10 total = 0.9 (90%)
+        expect(result.value.failureRate).toBeCloseTo(0.9);
+      }
+    });
+
+    it('should handle edge case with exact one hour boundary', async () => {
+      mockSuccessfulConnection(mockRedis);
+      await adapter.connect('redis://localhost:6379');
+
+      const now = Date.now();
+      const exactlyOneHourAgo = now - 60 * 60 * 1000;
+      const justOverOneHourAgo = now - 60 * 60 * 1000 - 1;
+
+      mockRedis.zrevrange.mockImplementation((key: string) => {
+        if (key === 'bull:test:completed') {
+          return Promise.resolve([
+            'job1', String(exactlyOneHourAgo),     // Should be included (>=)
+            'job2', String(justOverOneHourAgo),    // Should be excluded
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+
+      mockRedis.hgetall.mockImplementation((key: string) => {
+        return Promise.resolve({
+          data: '{}',
+          timestamp: String(now - 10000),
+          processedOn: String(now - 5000),
+          finishedOn: String(now - 1000),
+          attemptsMade: '1',
+        });
+      });
+
+      const result = await adapter.getMetrics('test');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // Only job1 should count (exactly at boundary)
+        expect(result.value.throughput).toBe(1);
+      }
+    });
+  });
+
   // Additional test suites will be added in subsequent subtasks:
-  // - subtask-12-5: getMetrics tests
   // - subtask-12-6: subscribe tests
 });
